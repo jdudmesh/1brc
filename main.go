@@ -2,15 +2,18 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"sync"
 	"time"
 )
+
+const cpuProfile = false
 
 // our approach is to build a trie of all the cities, and then walk it to get the results
 type Node struct {
@@ -22,11 +25,11 @@ type Node struct {
 	Count    int
 }
 
-func (n *Node) Insert(value []byte) {
+func (n *Node) Insert(value []byte) []byte {
 	// recurse down the supplied value, creating nodes as needed
 	cur := value[0]
 	if cur == ';' {
-		temp := extractValue(value[1:])
+		temp, rest := extractValue(value[1:])
 		if temp < n.Min || n.Min == 0 {
 			n.Min = temp
 		}
@@ -35,13 +38,13 @@ func (n *Node) Insert(value []byte) {
 		}
 		n.Sum += temp
 		n.Count++
-		return
+		return rest
 	}
 
 	if n.Children[cur] == nil {
 		n.Children[cur] = &Node{Key: cur, Children: make([]*Node, 256)}
 	}
-	n.Children[cur].Insert(value[1:])
+	return n.Children[cur].Insert(value[1:])
 }
 
 func (n *Node) Merge(other *Node) {
@@ -95,6 +98,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "took %s", time.Since(start))
 	}()
 
+	if cpuProfile {
+		f, err := os.Create(fmt.Sprintf("./profiles/%s.pprof", time.Now().UTC().Format("2006-01-02T15:04:05Z07:00")))
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
 	// open th file and read it in chunks
 	file, err := os.Open("../1brc/measurements.txt")
 	if err != nil {
@@ -116,14 +131,11 @@ func main() {
 			defer wgChunkReaders.Done()
 			tree := &Node{Key: 0, Children: make([]*Node, 256)}
 			for chunk := range chunks {
-				rdr := bytes.NewReader(chunk)
-				scanner := bufio.NewScanner(rdr)
-				for scanner.Scan() {
-					line := scanner.Bytes()
-					if line[0] == '#' {
-						continue
+				for {
+					chunk = tree.Insert(chunk)
+					if len(chunk) == 0 {
+						break
 					}
-					tree.Insert(line)
 				}
 			}
 			results <- tree
@@ -148,12 +160,17 @@ func main() {
 		if err != nil {
 			break
 		}
-		// find the last newline in the buffer, and send everything up to that point
-		last := bytes.LastIndex(buf[:num], []byte("\n"))
-		chunks <- buf[:last]
-		// seek back to the start of the last line
-		if last < num-1 {
-			file.Seek(int64(last-num+1), 1)
+		// if the buffer is less than 256MB, send it all - we're at the end of the file
+		if num < 256*1024*1024 {
+			chunks <- buf[:num]
+		} else {
+			// find the last newline in the buffer, and send everything up to that point
+			last := bytes.LastIndex(buf[:num], []byte("\n"))
+			chunks <- buf[:last]
+			// seek back to the start of the last line
+			if last < num-1 {
+				file.Seek(int64(last-num+1), 1)
+			}
 		}
 	}
 	// once the file is read, close the chunks channel and wait for the chunk readers to finish
@@ -179,12 +196,23 @@ func main() {
 	fmt.Print("}\n")
 }
 
-func extractValue(value []byte) int {
+func extractValue(value []byte) (int, []byte) {
 	// don't use strconv.Atoi because it's slow
 	mult := 1
 	result := 0
 	sign := 1
-	for i := len(value) - 1; i >= 0; i-- {
+
+	end := -1
+	for i, c := range value {
+		if c == '\n' {
+			end = i
+			break
+		}
+	}
+	if end == -1 {
+		end = len(value) - 1
+	}
+	for i := end; i >= 0; i-- {
 		if value[i] == '.' {
 			continue
 		}
@@ -195,5 +223,5 @@ func extractValue(value []byte) int {
 		result += int(value[i]-'0') * mult
 		mult *= 10
 	}
-	return result * sign
+	return result * sign, value[end+1:]
 }
